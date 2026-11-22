@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU unit tests for the sharded-delta primitives.
+"""Unit tests for the sharded-delta primitives.
 
 The full sharded path (DTensor shards + gather-v across ranks vs the full-gather diff) is
 validated bit-identically in a multi-GPU check; see
@@ -158,6 +158,47 @@ def test_prime_then_hf_delta_export_roundtrip():
         hf_delta_export(iter([("w", w2.clone(), spec)]), snaps, _hf_entry_identity)
     )
     assert counts2.tolist() == [0] and hf_idx2.numel() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="small-shard batching uses CUDA")
+def test_hf_delta_export_batches_small_shards_in_order():
+    from verl.workers.engine.spec import ShardSpec
+    from verl.workers.engine.utils import _hf_entry_identity, hf_delta_export, prime_delta_snapshots
+
+    old = [
+        (str(i), torch.zeros(size, dtype=torch.bfloat16, device="cuda"), ShardSpec(full_shape=(size,)))
+        for i, size in enumerate([4] * 33 + [65537, 4, 4])
+    ]
+    new = [(name, local.clone(), spec) for name, local, spec in old]
+    for i, (_, local, _) in enumerate(new):
+        if i != 1:
+            local[-1] = -0.0  # Numerically equal to +0, but a different byte pattern.
+
+    def seed():
+        snaps: dict = {}
+        prime_delta_snapshots(iter(old), snaps, pin=True)
+        return snaps
+
+    snaps = seed()
+    interrupted = hf_delta_export(iter(new), snaps, _hf_entry_identity, batch_small_shards=True)
+    next(interrupted)
+    interrupted.close()
+    torch.cuda.synchronize()
+    assert torch.equal(snaps["0"].view(torch.int16), new[0][1].cpu().view(torch.int16))
+    assert all(torch.equal(snaps[name].view(torch.int16), local.cpu().view(torch.int16)) for name, local, _ in old[1:])
+
+    expected = list(hf_delta_export(iter(new), seed(), _hf_entry_identity))
+    snaps = seed()
+    actual = list(hf_delta_export(iter(new), snaps, _hf_entry_identity, batch_small_shards=True))
+    for original, batched in zip(expected, actual, strict=True):
+        slots, dtype, counts, indices, values, pg = batched
+        assert (slots, dtype, pg) == (original[0], original[1], original[5])
+        assert torch.equal(counts, original[2])
+        assert torch.equal(indices, original[3])
+        assert torch.equal(values.view(torch.int16), original[4].view(torch.int16))
+
+    repeated = hf_delta_export(iter(new), snaps, _hf_entry_identity, batch_small_shards=True)
+    assert all(entry[3].numel() == 0 for entry in repeated)
 
 
 def test_hf_delta_export_converter_param():

@@ -287,7 +287,26 @@ def _hf_entry_identity(name, spec, place, lidx, lval):
     return [(name, tuple(spec.full_shape))], str(lval.dtype).replace("torch.", ""), counts, gidx, lval
 
 
-def hf_delta_export(gen, snaps: dict, entry_fn):
+def _flush_hf_delta_batch(small_shards, entry_fn):
+    if len(small_shards) < 3:
+        # Splitting the compacted indices also synchronizes once.
+        local_indices = [row[-1].nonzero(as_tuple=True)[0] for row in small_shards]
+    else:
+        offsets = [0]
+        for _, local, _, _, _, _, _ in small_shards:
+            offsets.append(offsets[-1] + local.numel())
+        indices = torch.cat([row[-1] for row in small_shards]).nonzero(as_tuple=True)[0]
+        boundaries = torch.tensor(offsets[1:-1], device=indices.device, dtype=indices.dtype)
+        cuts = [0, *torch.searchsorted(indices, boundaries).tolist(), indices.numel()]
+        local_indices = [
+            indices[lo:hi] - offset for lo, hi, offset in zip(cuts[:-1], cuts[1:], offsets[:-1], strict=True)
+        ]
+    for (name, local, spec, place, pg, snap, _), lidx in zip(small_shards, local_indices, strict=True):
+        snap.copy_(local, non_blocking=True)
+        yield (*entry_fn(name, spec, place, lidx, local[lidx]), pg)
+
+
+def hf_delta_export(gen, snaps: dict, entry_fn, *, batch_small_shards: bool = False):
     """STEADY export: wrap a raw ``(name, local_shard, spec)`` exporter into final
     HF-coordinate delta entries ``(slots, dtype_str, counts, hf_idx, hf_val,
     gather_group)`` -- diff against the pinned snapshot, refresh it, then hand the
@@ -295,11 +314,13 @@ def hf_delta_export(gen, snaps: dict, entry_fn):
     per-param entry builder (FSDP: identity only; veomni adds the EP converter).
     The delta engine consumes these entries verbatim (batch -> gather -> wire); no
     spec, no placement and no conversion cross the boundary. Requires a prior seed
-    pass."""
+    pass. CUDA FSDP2 can batch index extraction for consecutive small BF16
+    shards while retaining the original order of the exported deltas."""
     from verl.checkpoint_engine.delta_sync.sparse_gather import shard_delta_indices
 
     from .spec import derive_dtensor_placement
 
+    small_shards = []
     for name, local, spec in gen:
         local = local.detach().contiguous().view(-1)
         snap = snaps.get(name)
@@ -312,6 +333,24 @@ def hf_delta_export(gen, snaps: dict, entry_fn):
             place, contributes, pg = spec.place, spec.contributes, spec.gather_group
         else:
             place, contributes, pg = derive_dtensor_placement(spec)
+        batch_shard = (
+            batch_small_shards
+            and contributes
+            and local.is_cuda
+            and local.dtype == torch.bfloat16
+            and 0 < local.numel() <= 65536
+        )
+        if batch_shard:
+            base = snap.to(local.device, non_blocking=True)
+            mask = local.view(torch.int16) != base.view(torch.int16)
+            small_shards.append((name, local, spec, place, pg, snap, mask))
+            if len(small_shards) == 32:
+                yield from _flush_hf_delta_batch(small_shards, entry_fn)
+                small_shards.clear()
+            continue
+        if small_shards:
+            yield from _flush_hf_delta_batch(small_shards, entry_fn)
+            small_shards.clear()
         if contributes:
             base = snap.to(local.device, non_blocking=True)
             lidx, lval = shard_delta_indices(local, base, 0)
@@ -321,6 +360,8 @@ def hf_delta_export(gen, snaps: dict, entry_fn):
             lval = torch.empty(0, dtype=local.dtype, device=local.device)
         snap.copy_(local, non_blocking=True)
         yield (*entry_fn(name, spec, place, lidx, lval), pg)
+    if small_shards:
+        yield from _flush_hf_delta_batch(small_shards, entry_fn)
 
 
 def prime_delta_snapshots(gen, snaps: dict, pin: bool) -> None:

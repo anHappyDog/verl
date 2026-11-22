@@ -925,7 +925,12 @@ class FSDPEngine(BaseEngine):
 
         self._delta_shard_snap = getattr(self, "_delta_shard_snap", {})
         gen, _ = self.get_per_tensor_param_shard()
-        return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
+        return (
+            hf_delta_export(
+                gen, self._delta_shard_snap, self._hf_delta_entry, batch_small_shards=fsdp_version(self.module) == 2
+            ),
+            None,
+        )
 
     def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
